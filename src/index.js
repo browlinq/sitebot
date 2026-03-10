@@ -1,3 +1,6 @@
+const fs = require('fs');
+const path = require('path');
+const http = require('http');
 const fetch = require('node-fetch');
 const TelegramBot = require('node-telegram-bot-api');
 require('dotenv').config();
@@ -5,30 +8,90 @@ require('dotenv').config();
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const CHECK_INTERVAL_MS = parseInt(process.env.CHECK_INTERVAL_MS || '15000', 10);
 const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || '10000', 10);
+const PORT = process.env.PORT || 3000;
+
+const WELCOME_LOGO_URL = 'https://i.hizliresim.com/lgnireg.png';
+const DATA_FILE = path.join(__dirname, '..', 'data.json');
 
 if (!TELEGRAM_TOKEN) {
-  throw new Error('TELEGRAM_TOKEN eksik. .env dosyasını kontrol et.');
+  throw new Error('TELEGRAM_TOKEN eksik.');
 }
+
+/**
+ * Web service health server
+ */
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('AquaBahis bot is running');
+}).listen(PORT, () => {
+  console.log(`Health server running on port ${PORT}`);
+});
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
 /**
- * Chat bazlı oturum yapısı:
+ * Kalıcı veri yapısı
+ */
+const db = loadDb();
+
+/**
+ * Geçici oturumlar
+ */
+const sessions = Object.create(null);
+
+/**
  * sessions[chatId] = {
  *   monitoring: boolean,
  *   muted: boolean,
  *   interval: Timeout | null,
  *   knownStates: {
  *     [site]: {
+ *       site: string,
  *       isUp: boolean,
  *       statusCode: number | null,
  *       detail: string,
- *       lastCheckedAt: Date
+ *       lastCheckedAt: Date,
+ *       countryResults?: object
  *     }
  *   }
  * }
  */
-const sessions = Object.create(null);
+
+function loadDb() {
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    }
+  } catch (error) {
+    console.error('data.json okunamadı:', error.message);
+  }
+
+  const initial = {
+    admins: parseCsv(process.env.ADMIN_CHAT_IDS || ''),
+    sites: parseCsv(process.env.SITES_TO_CHECK || '').map(normalizeSite).filter(Boolean),
+    allowedCountries: parseCsv(process.env.ALLOWED_COUNTRIES || 'TR'),
+    blockedCountries: parseCsv(process.env.BLOCKED_COUNTRIES || ''),
+    uptime: {}
+  };
+
+  saveDb(initial);
+  return initial;
+}
+
+function saveDb(data = db) {
+  try {
+    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), 'utf8');
+  } catch (error) {
+    console.error('data.json yazılamadı:', error.message);
+  }
+}
+
+function parseCsv(value) {
+  return String(value || '')
+    .split(',')
+    .map(v => v.trim())
+    .filter(Boolean);
+}
 
 function ensureSession(chatId) {
   const key = String(chatId);
@@ -46,11 +109,7 @@ function ensureSession(chatId) {
 }
 
 function getSites() {
-  return (process.env.SITES_TO_CHECK || '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean)
-    .map(normalizeSite);
+  return (db.sites || []).map(normalizeSite).filter(Boolean);
 }
 
 function normalizeSite(site) {
@@ -80,15 +139,33 @@ function formatDate(date) {
   return new Date(date).toLocaleString('tr-TR');
 }
 
-function mainMenu() {
+function isAdmin(chatId) {
+  return (db.admins || []).map(String).includes(String(chatId));
+}
+
+function addAdmin(chatId) {
+  const id = String(chatId);
+  if (!db.admins.map(String).includes(id)) {
+    db.admins.push(id);
+    saveDb();
+  }
+}
+
+function mainMenu(isUserAdmin = false) {
+  const base = [
+    ['▶️ BAŞLAT', '⏹️ DURDUR'],
+    ['📊 DURUM', '🔎 KONTROL ET'],
+    ['🌐 TÜM SİTELER', '🔕 SUSTUR'],
+    ['🔔 AKTİF ET', '❓ YARDIM']
+  ];
+
+  if (isUserAdmin) {
+    base.push(['👑 ADMIN PANEL']);
+  }
+
   return {
     reply_markup: {
-      keyboard: [
-        ['▶️ BAŞLAT', '⏹️ DURDUR'],
-        ['📊 DURUM', '🔎 KONTROL ET'],
-        ['🌐 TÜM SİTELER', '🔕 SUSTUR'],
-        ['🔔 AKTİF ET', '❓ YARDIM']
-      ],
+      keyboard: base,
       resize_keyboard: true,
       one_time_keyboard: false
     }
@@ -99,9 +176,7 @@ function inlineSiteButtons(site) {
   return {
     reply_markup: {
       inline_keyboard: [
-        [
-          { text: '🌐 Siteye Git', url: site }
-        ],
+        [{ text: '🌐 Siteye Git', url: site }],
         [
           { text: '🔄 Yeniden Kontrol', callback_data: `check:${site}` },
           { text: 'ℹ️ Son Durum', callback_data: `status:${site}` }
@@ -123,6 +198,33 @@ async function sendMessage(chatId, text, extra = {}) {
   }
 }
 
+async function sendWelcomePhoto(chatId) {
+  const caption =
+    `💎 <b>AquaBahis Web Sitesi Kontrol Botuna Hoşgeldiniz</b>\n\n` +
+    `Bu bot site durumunu, kesintileri ve erişim sorunlarını takip eder.\n\n` +
+    `📡 <b>Özellikler</b>\n` +
+    `• 15 saniyede bir otomatik kontrol\n` +
+    `• Özel tasarımlı down bildirimi\n` +
+    `• Uptime yüzdesi\n` +
+    `• Ülke bazlı erişim özeti\n` +
+    `• Admin paneli / site ekleme / silme\n\n` +
+    `👇 Aşağıdaki menüden işlemleri kullanabilirsiniz.`;
+
+  try {
+    await bot.sendPhoto(chatId, WELCOME_LOGO_URL, {
+      caption,
+      parse_mode: 'HTML',
+      reply_markup: mainMenu(isAdmin(chatId)).reply_markup
+    });
+  } catch (error) {
+    await sendMessage(
+      chatId,
+      `💎 <b>AquaBahis Web Sitesi Kontrol Botuna Hoşgeldiniz</b>`,
+      mainMenu(isAdmin(chatId))
+    );
+  }
+}
+
 async function fetchWithTimeout(url, timeoutMs = REQUEST_TIMEOUT_MS) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -131,7 +233,7 @@ async function fetchWithTimeout(url, timeoutMs = REQUEST_TIMEOUT_MS) {
     return await fetch(url, {
       signal: controller.signal,
       headers: {
-        'User-Agent': 'advanced-site-monitor-bot/1.0'
+        'User-Agent': 'aquabahis-monitor-bot/2.0'
       }
     });
   } finally {
@@ -139,29 +241,75 @@ async function fetchWithTimeout(url, timeoutMs = REQUEST_TIMEOUT_MS) {
   }
 }
 
+function ensureUptimeSite(site) {
+  if (!db.uptime[site]) {
+    db.uptime[site] = {
+      totalChecks: 0,
+      successChecks: 0,
+      failureChecks: 0
+    };
+  }
+  return db.uptime[site];
+}
+
+function getUptimePercent(site) {
+  const row = ensureUptimeSite(site);
+  if (!row.totalChecks) return '0.00';
+  return ((row.successChecks / row.totalChecks) * 100).toFixed(2);
+}
+
+function updateUptime(site, isUp) {
+  const row = ensureUptimeSite(site);
+  row.totalChecks += 1;
+
+  if (isUp) row.successChecks += 1;
+  else row.failureChecks += 1;
+
+  saveDb();
+}
+
 function buildStatusCard(site, result) {
   const checkedAt = formatDate(result.lastCheckedAt);
+  const uptime = getUptimePercent(site);
 
   if (result.isUp) {
     return (
-      `✅ <b>Site Kontrol Bildirimi</b>\n` +
-      `Kontrol Sonucu: ${escapeHtml(String(result.statusCode))}\n` +
+      `✅ <b>AquaBahis Site Kontrol Bildirimi</b>\n` +
+      `Kontrol Sonucu: ${escapeHtml(String(result.statusCode))} Aktif\n` +
       `Sunucu Durumu: Aktif\n` +
       `Erişim Durumu: Açık\n` +
+      `Uptime: %${escapeHtml(uptime)}\n` +
       `Siteye Gitmek İçin: <a href="${escapeHtml(site)}">Tıkla</a>\n` +
       `Kontrol Zamanı: ${escapeHtml(checkedAt)}`
     );
   }
 
+  const countryText = formatCountryResults(result.countryResults);
+
   return (
-    `🚨 <b>Site Kontrol Bildirimi</b>\n` +
+    `🚨 <b>AquaBahis Kritik Erişim Uyarısı</b>\n` +
+    `━━━━━━━━━━━━━━\n` +
     `Kontrol Sonucu: ${escapeHtml(result.detail)}\n` +
     `Sunucu Durumu: Sorunlu\n` +
     `Erişim Durumu: Engelli veya Ulaşılamıyor\n` +
+    `Uptime: %${escapeHtml(uptime)}\n` +
+    `${countryText ? `Bölgesel Kontrol: ${escapeHtml(countryText)}\n` : ''}` +
     `Siteye Gitmek İçin: <a href="${escapeHtml(site)}">Tıkla</a>\n` +
     `Kontrol Zamanı: ${escapeHtml(checkedAt)}\n` +
+    `━━━━━━━━━━━━━━\n` +
     `Herhangi bir erişim engeli veya kesinti tespit edilmiştir.`
   );
+}
+
+function formatCountryResults(countryResults) {
+  if (!countryResults) return '';
+
+  const entries = Object.entries(countryResults);
+  if (!entries.length) return '';
+
+  return entries
+    .map(([country, ok]) => `${country}:${ok ? 'Açık' : 'Kapalı'}`)
+    .join(', ');
 }
 
 function stateChanged(prev, next) {
@@ -169,7 +317,31 @@ function stateChanged(prev, next) {
   if (prev.isUp !== next.isUp) return true;
   if (prev.statusCode !== next.statusCode) return true;
   if (prev.detail !== next.detail) return true;
+
+  const prevCountries = JSON.stringify(prev.countryResults || {});
+  const nextCountries = JSON.stringify(next.countryResults || {});
+  if (prevCountries !== nextCountries) return true;
+
   return false;
+}
+
+/**
+ * Basit ülke bazlı kontrol
+ * Gerçek geo-proxy olmadan ülkeye özel tam doğrulama yapılamaz.
+ * Bu yüzden burada özet alanı var:
+ * - allowedCountries listelenir
+ * - ana kontrol down ise hepsi kapalı sayılır
+ * - ana kontrol up ise hepsi açık varsayılır
+ */
+function buildCountryResults(isUp) {
+  const results = {};
+  const countries = db.allowedCountries || [];
+
+  for (const country of countries) {
+    results[country] = Boolean(isUp);
+  }
+
+  return results;
 }
 
 async function checkSite(site) {
@@ -177,35 +349,43 @@ async function checkSite(site) {
     const response = await fetchWithTimeout(site);
     const ok = response.ok;
     const status = response.status;
+    const countryResults = buildCountryResults(ok);
 
     if (ok) {
+      updateUptime(site, true);
       return {
         site,
         isUp: true,
         statusCode: status,
         detail: `${status} Aktif`,
-        lastCheckedAt: new Date()
+        lastCheckedAt: new Date(),
+        countryResults
       };
     }
 
+    updateUptime(site, false);
     return {
       site,
       isUp: false,
       statusCode: status,
       detail: `${status} Hatası`,
-      lastCheckedAt: new Date()
+      lastCheckedAt: new Date(),
+      countryResults
     };
   } catch (error) {
     const detail = error.name === 'AbortError'
       ? `Timeout (${REQUEST_TIMEOUT_MS}ms)`
       : (error.message || 'Bağlantı Hatası');
 
+    updateUptime(site, false);
+
     return {
       site,
       isUp: false,
       statusCode: null,
       detail,
-      lastCheckedAt: new Date()
+      lastCheckedAt: new Date(),
+      countryResults: buildCountryResults(false)
     };
   }
 }
@@ -221,7 +401,7 @@ async function checkAllForChat(chatId, options = {}) {
   const notifyAlways = Boolean(options.notifyAlways);
 
   if (!sites.length) {
-    await sendMessage(chatId, '⚠️ Kontrol edilecek site bulunamadı. .env içindeki SITES_TO_CHECK alanını doldur.');
+    await sendMessage(chatId, '⚠️ Kontrol edilecek site bulunamadı.');
     return [];
   }
 
@@ -258,43 +438,76 @@ async function sendSummary(chatId) {
 
   let active = 0;
   let down = 0;
-
   const lines = [];
 
   for (const site of sites) {
     const state = session.knownStates[site];
+    const uptime = getUptimePercent(site);
 
     if (!state) {
-      lines.push(`• ${site} → Henüz kontrol edilmedi`);
+      lines.push(`• ${site} → Henüz kontrol edilmedi | Uptime: %${uptime}`);
       continue;
     }
 
     if (state.isUp) {
       active += 1;
-      lines.push(`• ${site} → ✅ Aktif (${state.statusCode})`);
+      lines.push(`• ${site} → ✅ Aktif (${state.statusCode}) | Uptime: %${uptime}`);
     } else {
       down += 1;
-      lines.push(`• ${site} → 🚨 Sorunlu (${state.detail})`);
+      lines.push(`• ${site} → 🚨 Sorunlu (${state.detail}) | Uptime: %${uptime}`);
     }
   }
 
   const text =
-    `<b>Genel Durum Raporu</b>\n` +
+    `<b>AquaBahis Genel Durum Raporu</b>\n` +
     `Toplam Site: ${sites.length}\n` +
     `Aktif: ${active}\n` +
     `Sorunlu: ${down}\n` +
     `İzleme: ${session.monitoring ? 'Açık' : 'Kapalı'}\n` +
-    `Bildirim: ${session.muted ? 'Susturulmuş' : 'Aktif'}\n\n` +
+    `Bildirim: ${session.muted ? 'Susturulmuş' : 'Aktif'}\n` +
+    `İzinli Ülkeler: ${(db.allowedCountries || []).join(', ') || '-'}\n\n` +
     lines.map(escapeHtml).join('\n');
 
-  await sendMessage(chatId, text);
+  await sendMessage(chatId, text, mainMenu(isAdmin(chatId)));
+}
+
+async function sendAdminPanel(chatId) {
+  if (!isAdmin(chatId)) {
+    await sendMessage(chatId, '⛔ Admin yetkisi yok.');
+    return;
+  }
+
+  const text =
+    `👑 <b>Admin Panel</b>\n\n` +
+    `Kullanım:\n` +
+    `/addsite https://site.com\n` +
+    `/removesite https://site.com\n` +
+    `/sites\n` +
+    `/admins\n` +
+    `/addadmin 123456789\n` +
+    `/countries\n` +
+    `/addcountry TR\n` +
+    `/removecountry TR`;
+
+  await sendMessage(chatId, text, {
+    reply_markup: {
+      keyboard: [
+        ['▶️ BAŞLAT', '⏹️ DURDUR'],
+        ['📊 DURUM', '🔎 KONTROL ET'],
+        ['🌐 TÜM SİTELER', '🔕 SUSTUR'],
+        ['🔔 AKTİF ET', '❓ YARDIM'],
+        ['📁 SİTELER', '🌍 ÜLKELER']
+      ],
+      resize_keyboard: true
+    }
+  });
 }
 
 async function startMonitoring(chatId) {
   const session = ensureSession(chatId);
 
   if (session.monitoring) {
-    await sendMessage(chatId, '✅ İzleme zaten aktif.', mainMenu());
+    await sendMessage(chatId, '✅ İzleme zaten aktif.', mainMenu(isAdmin(chatId)));
     return;
   }
 
@@ -302,10 +515,10 @@ async function startMonitoring(chatId) {
 
   await sendMessage(
     chatId,
-    `✅ <b>Site Kontrol Botu Başlatıldı</b>\n` +
+    `✅ <b>AquaBahis Kontrol Sistemi Başlatıldı</b>\n` +
       `Kontrol Aralığı: ${CHECK_INTERVAL_MS / 1000} saniye\n` +
       `İzlenen Site Sayısı: ${getSites().length}`,
-    mainMenu()
+    mainMenu(isAdmin(chatId))
   );
 
   await checkAllForChat(chatId, { notifyAlways: true });
@@ -324,7 +537,7 @@ async function stopMonitoring(chatId) {
   const session = ensureSession(chatId);
 
   if (!session.monitoring) {
-    await sendMessage(chatId, '⚠️ İzleme zaten kapalı.', mainMenu());
+    await sendMessage(chatId, '⚠️ İzleme zaten kapalı.', mainMenu(isAdmin(chatId)));
     return;
   }
 
@@ -335,24 +548,24 @@ async function stopMonitoring(chatId) {
     session.interval = null;
   }
 
-  await sendMessage(chatId, '⏹️ İzleme durduruldu.', mainMenu());
+  await sendMessage(chatId, '⏹️ İzleme durduruldu.', mainMenu(isAdmin(chatId)));
 }
 
 async function muteNotifications(chatId) {
   const session = ensureSession(chatId);
   session.muted = true;
-  await sendMessage(chatId, '🔕 Bildirimler susturuldu.', mainMenu());
+  await sendMessage(chatId, '🔕 Bildirimler susturuldu.', mainMenu(isAdmin(chatId)));
 }
 
 async function unmuteNotifications(chatId) {
   const session = ensureSession(chatId);
   session.muted = false;
-  await sendMessage(chatId, '🔔 Bildirimler tekrar aktif.', mainMenu());
+  await sendMessage(chatId, '🔔 Bildirimler tekrar aktif.', mainMenu(isAdmin(chatId)));
 }
 
 async function help(chatId) {
   const text =
-    `<b>Kullanılabilir Komutlar</b>\n` +
+    `<b>AquaBahis Bot Komutları</b>\n` +
     `/start - botu başlatır ve menüyü açar\n` +
     `/stop - izlemeyi durdurur\n` +
     `/check - tüm siteleri hemen kontrol eder\n` +
@@ -360,14 +573,16 @@ async function help(chatId) {
     `/mute - bildirimleri susturur\n` +
     `/unmute - bildirimleri tekrar açar\n` +
     `/sites - izlenen siteleri listeler\n\n` +
-    `<b>Butonlar</b>\n` +
-    `▶️ BAŞLAT - otomatik izlemeyi açar\n` +
-    `⏹️ DURDUR - otomatik izlemeyi kapatır\n` +
-    `📊 DURUM - özet rapor gösterir\n` +
-    `🔎 KONTROL ET - ilk siteyi manuel kontrol eder\n` +
-    `🌐 TÜM SİTELER - hepsini manuel kontrol eder`;
+    `<b>Admin Komutları</b>\n` +
+    `/addsite URL\n` +
+    `/removesite URL\n` +
+    `/admins\n` +
+    `/addadmin CHAT_ID\n` +
+    `/countries\n` +
+    `/addcountry TR\n` +
+    `/removecountry TR`;
 
-  await sendMessage(chatId, text, mainMenu());
+  await sendMessage(chatId, text, mainMenu(isAdmin(chatId)));
 }
 
 async function listSites(chatId) {
@@ -380,14 +595,138 @@ async function listSites(chatId) {
 
   const text =
     `<b>İzlenen Siteler</b>\n\n` +
-    sites.map((site, index) => `${index + 1}. ${escapeHtml(site)}`).join('\n');
+    sites.map((site, index) => `${index + 1}. ${escapeHtml(site)} | Uptime: %${getUptimePercent(site)}`).join('\n');
 
-  await sendMessage(chatId, text, mainMenu());
+  await sendMessage(chatId, text, mainMenu(isAdmin(chatId)));
+}
+
+async function addSite(chatId, rawSite) {
+  if (!isAdmin(chatId)) {
+    await sendMessage(chatId, '⛔ Bu komut sadece admin içindir.');
+    return;
+  }
+
+  const site = normalizeSite(rawSite);
+  if (!site) {
+    await sendMessage(chatId, '⚠️ Kullanım: /addsite https://site.com');
+    return;
+  }
+
+  if (db.sites.includes(site)) {
+    await sendMessage(chatId, 'ℹ️ Bu site zaten listede.');
+    return;
+  }
+
+  db.sites.push(site);
+  saveDb();
+  await sendMessage(chatId, `✅ Site eklendi:\n${escapeHtml(site)}`, mainMenu(true));
+}
+
+async function removeSite(chatId, rawSite) {
+  if (!isAdmin(chatId)) {
+    await sendMessage(chatId, '⛔ Bu komut sadece admin içindir.');
+    return;
+  }
+
+  const site = normalizeSite(rawSite);
+  const before = db.sites.length;
+  db.sites = db.sites.filter(s => s !== site);
+  saveDb();
+
+  if (db.sites.length === before) {
+    await sendMessage(chatId, 'ℹ️ Site listede bulunamadı.');
+    return;
+  }
+
+  delete db.uptime[site];
+  saveDb();
+
+  await sendMessage(chatId, `🗑️ Site silindi:\n${escapeHtml(site)}`, mainMenu(true));
+}
+
+async function listAdmins(chatId) {
+  if (!isAdmin(chatId)) {
+    await sendMessage(chatId, '⛔ Bu komut sadece admin içindir.');
+    return;
+  }
+
+  const text =
+    `<b>Adminler</b>\n\n` +
+    db.admins.map((id, index) => `${index + 1}. ${escapeHtml(id)}`).join('\n');
+
+  await sendMessage(chatId, text, mainMenu(true));
+}
+
+async function addAdminCommand(chatId, newAdminId) {
+  if (!isAdmin(chatId)) {
+    await sendMessage(chatId, '⛔ Bu komut sadece admin içindir.');
+    return;
+  }
+
+  if (!newAdminId) {
+    await sendMessage(chatId, '⚠️ Kullanım: /addadmin 123456789');
+    return;
+  }
+
+  addAdmin(newAdminId);
+  await sendMessage(chatId, `✅ Admin eklendi: ${escapeHtml(newAdminId)}`, mainMenu(true));
+}
+
+async function listCountries(chatId) {
+  const text =
+    `<b>İzinli Ülkeler</b>\n\n` +
+    ((db.allowedCountries || []).length
+      ? db.allowedCountries.map((c, i) => `${i + 1}. ${escapeHtml(c)}`).join('\n')
+      : 'Tanımlı ülke yok.');
+
+  await sendMessage(chatId, text, mainMenu(isAdmin(chatId)));
+}
+
+async function addCountry(chatId, country) {
+  if (!isAdmin(chatId)) {
+    await sendMessage(chatId, '⛔ Bu komut sadece admin içindir.');
+    return;
+  }
+
+  const code = String(country || '').trim().toUpperCase();
+  if (!code) {
+    await sendMessage(chatId, '⚠️ Kullanım: /addcountry TR');
+    return;
+  }
+
+  if (!db.allowedCountries.includes(code)) {
+    db.allowedCountries.push(code);
+    saveDb();
+  }
+
+  await sendMessage(chatId, `✅ Ülke eklendi: ${escapeHtml(code)}`, mainMenu(true));
+}
+
+async function removeCountry(chatId, country) {
+  if (!isAdmin(chatId)) {
+    await sendMessage(chatId, '⛔ Bu komut sadece admin içindir.');
+    return;
+  }
+
+  const code = String(country || '').trim().toUpperCase();
+  db.allowedCountries = db.allowedCountries.filter(c => c !== code);
+  saveDb();
+
+  await sendMessage(chatId, `🗑️ Ülke silindi: ${escapeHtml(code)}`, mainMenu(true));
 }
 
 bot.onText(/\/start/, async (msg) => {
   if (!isPrivateChat(msg)) return;
-  await startMonitoring(msg.chat.id);
+
+  const chatId = msg.chat.id;
+  ensureSession(chatId);
+
+  if (db.admins.length === 0) {
+    addAdmin(chatId);
+  }
+
+  await sendWelcomePhoto(chatId);
+  await startMonitoring(chatId);
 });
 
 bot.onText(/\/stop/, async (msg) => {
@@ -402,8 +741,7 @@ bot.onText(/\/help/, async (msg) => {
 
 bot.onText(/\/check/, async (msg) => {
   if (!isPrivateChat(msg)) return;
-
-  await sendMessage(msg.chat.id, '🔎 Manuel kontrol başlatıldı...', mainMenu());
+  await sendMessage(msg.chat.id, '🔎 Manuel kontrol başlatıldı...', mainMenu(isAdmin(msg.chat.id)));
   await checkAllForChat(msg.chat.id, { notifyAlways: true });
 });
 
@@ -427,6 +765,41 @@ bot.onText(/\/sites/, async (msg) => {
   await listSites(msg.chat.id);
 });
 
+bot.onText(/\/admins/, async (msg) => {
+  if (!isPrivateChat(msg)) return;
+  await listAdmins(msg.chat.id);
+});
+
+bot.onText(/\/addadmin(?:\s+(.+))?/, async (msg, match) => {
+  if (!isPrivateChat(msg)) return;
+  await addAdminCommand(msg.chat.id, match && match[1]);
+});
+
+bot.onText(/\/addsite(?:\s+(.+))?/, async (msg, match) => {
+  if (!isPrivateChat(msg)) return;
+  await addSite(msg.chat.id, match && match[1]);
+});
+
+bot.onText(/\/removesite(?:\s+(.+))?/, async (msg, match) => {
+  if (!isPrivateChat(msg)) return;
+  await removeSite(msg.chat.id, match && match[1]);
+});
+
+bot.onText(/\/countries/, async (msg) => {
+  if (!isPrivateChat(msg)) return;
+  await listCountries(msg.chat.id);
+});
+
+bot.onText(/\/addcountry(?:\s+(.+))?/, async (msg, match) => {
+  if (!isPrivateChat(msg)) return;
+  await addCountry(msg.chat.id, match && match[1]);
+});
+
+bot.onText(/\/removecountry(?:\s+(.+))?/, async (msg, match) => {
+  if (!isPrivateChat(msg)) return;
+  await removeCountry(msg.chat.id, match && match[1]);
+});
+
 bot.on('message', async (msg) => {
   if (!isPrivateChat(msg)) return;
   if (!msg.text) return;
@@ -435,65 +808,46 @@ bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
 
   if (
-    text === '/start' ||
-    text === '/stop' ||
-    text === '/help' ||
-    text === '/check' ||
-    text === '/status' ||
-    text === '/mute' ||
-    text === '/unmute' ||
-    text === '/sites'
+    text.startsWith('/start') ||
+    text.startsWith('/stop') ||
+    text.startsWith('/help') ||
+    text.startsWith('/check') ||
+    text.startsWith('/status') ||
+    text.startsWith('/mute') ||
+    text.startsWith('/unmute') ||
+    text.startsWith('/sites') ||
+    text.startsWith('/admins') ||
+    text.startsWith('/addadmin') ||
+    text.startsWith('/addsite') ||
+    text.startsWith('/removesite') ||
+    text.startsWith('/countries') ||
+    text.startsWith('/addcountry') ||
+    text.startsWith('/removecountry')
   ) {
     return;
   }
 
-  if (text === '▶️ BAŞLAT') {
-    await startMonitoring(chatId);
-    return;
-  }
-
-  if (text === '⏹️ DURDUR') {
-    await stopMonitoring(chatId);
-    return;
-  }
-
-  if (text === '📊 DURUM') {
-    await sendSummary(chatId);
-    return;
-  }
+  if (text === '▶️ BAŞLAT') return startMonitoring(chatId);
+  if (text === '⏹️ DURDUR') return stopMonitoring(chatId);
+  if (text === '📊 DURUM') return sendSummary(chatId);
+  if (text === '🔕 SUSTUR') return muteNotifications(chatId);
+  if (text === '🔔 AKTİF ET') return unmuteNotifications(chatId);
+  if (text === '❓ YARDIM') return help(chatId);
+  if (text === '👑 ADMIN PANEL') return sendAdminPanel(chatId);
+  if (text === '📁 SİTELER') return listSites(chatId);
+  if (text === '🌍 ÜLKELER') return listCountries(chatId);
 
   if (text === '🔎 KONTROL ET') {
     const firstSite = getSites()[0];
-
-    if (!firstSite) {
-      await sendMessage(chatId, '⚠️ İlk kontrol için site bulunamadı.', mainMenu());
-      return;
-    }
-
+    if (!firstSite) return sendMessage(chatId, '⚠️ Site bulunamadı.', mainMenu(isAdmin(chatId)));
     const result = await checkSite(firstSite);
     ensureSession(chatId).knownStates[firstSite] = result;
-    await sendSiteResult(chatId, firstSite, result);
-    return;
+    return sendSiteResult(chatId, firstSite, result);
   }
 
   if (text === '🌐 TÜM SİTELER') {
-    await sendMessage(chatId, '🔎 Tüm siteler manuel olarak kontrol ediliyor...', mainMenu());
-    await checkAllForChat(chatId, { notifyAlways: true });
-    return;
-  }
-
-  if (text === '🔕 SUSTUR') {
-    await muteNotifications(chatId);
-    return;
-  }
-
-  if (text === '🔔 AKTİF ET') {
-    await unmuteNotifications(chatId);
-    return;
-  }
-
-  if (text === '❓ YARDIM') {
-    await help(chatId);
+    await sendMessage(chatId, '🔎 Tüm siteler manuel olarak kontrol ediliyor...', mainMenu(isAdmin(chatId)));
+    return checkAllForChat(chatId, { notifyAlways: true });
   }
 });
 
@@ -531,6 +885,8 @@ bot.on('callback_query', async (query) => {
         `Site: <a href="${escapeHtml(site)}">${escapeHtml(site)}</a>\n` +
         `Sunucu Durumu: ${state.isUp ? 'Aktif' : 'Sorunlu'}\n` +
         `Detay: ${escapeHtml(state.isUp ? String(state.statusCode) : state.detail)}\n` +
+        `Uptime: %${escapeHtml(getUptimePercent(site))}\n` +
+        `Bölgesel Kontrol: ${escapeHtml(formatCountryResults(state.countryResults) || '-')}\n` +
         `Son Kontrol: ${escapeHtml(formatDate(state.lastCheckedAt))}`;
 
       await bot.answerCallbackQuery(query.id, { text: 'Son durum gösterildi.' });
@@ -551,6 +907,6 @@ bot.on('polling_error', (error) => {
   console.error('Polling error:', error.message);
 });
 
-console.log('Bot çalışıyor...');
+console.log('AquaBahis bot çalışıyor...');
 console.log(`Kontrol aralığı: ${CHECK_INTERVAL_MS} ms`);
 console.log(`İzlenen siteler: ${getSites().join(', ') || 'YOK'}`);
