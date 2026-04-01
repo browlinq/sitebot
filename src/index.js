@@ -6,7 +6,7 @@ const TelegramBot = require('node-telegram-bot-api');
 require('dotenv').config();
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const CHECK_INTERVAL_MS = parseInt(process.env.CHECK_INTERVAL_MS || '15000', 10);
+const CHECK_INTERVAL_MS = parseInt(process.env.CHECK_INTERVAL_MS || '60000', 10);
 const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || '10000', 10);
 const PORT = process.env.PORT || 3000;
 
@@ -526,7 +526,7 @@ async function startMonitoring(chatId) {
   session.interval = setInterval(async () => {
     try {
       if (!session.monitoring) return;
-      await checkAllForChat(chatId, { notifyAlways: false });
+      await checkAllForChat(chatId, { notifyAlways: true });
     } catch (error) {
       console.error(`interval error (${chatId}):`, error.message);
     }
