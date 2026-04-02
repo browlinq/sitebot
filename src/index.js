@@ -6,7 +6,7 @@ const TelegramBot = require('node-telegram-bot-api');
 require('dotenv').config();
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const CHECK_INTERVAL_MS = parseInt(process.env.CHECK_INTERVAL_MS || '60000', 10);
+const CHECK_INTERVAL_MS = parseInt(process.env.CHECK_INTERVAL_MS || '15000', 10);
 const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || '10000', 10);
 const PORT = process.env.PORT || 3000;
 
@@ -131,6 +131,10 @@ function escapeHtml(value) {
     .replace(/"/g, '&quot;');
 }
 
+function isAllowedChat(msg) {
+  return msg && msg.chat && ['private', 'group', 'supergroup'].includes(msg.chat.type);
+}
+
 function isPrivateChat(msg) {
   return msg && msg.chat && msg.chat.type === 'private';
 }
@@ -203,7 +207,7 @@ async function sendWelcomePhoto(chatId) {
     `💎 <b>AquaBahis Web Sitesi Kontrol Botuna Hoşgeldiniz</b>\n\n` +
     `Bu bot site durumunu, kesintileri ve erişim sorunlarını takip eder.\n\n` +
     `📡 <b>Özellikler</b>\n` +
-    `• 15 saniyede bir otomatik kontrol\n` +
+    `• ${CHECK_INTERVAL_MS / 1000} saniyede bir otomatik kontrol\n` +
     `• Özel tasarımlı down bildirimi\n` +
     `• Uptime yüzdesi\n` +
     `• Ülke bazlı erişim özeti\n` +
@@ -526,7 +530,7 @@ async function startMonitoring(chatId) {
   session.interval = setInterval(async () => {
     try {
       if (!session.monitoring) return;
-      await checkAllForChat(chatId, { notifyAlways: true });
+      await checkAllForChat(chatId, { notifyAlways: false });
     } catch (error) {
       console.error(`interval error (${chatId}):`, error.message);
     }
@@ -716,92 +720,101 @@ async function removeCountry(chatId, country) {
 }
 
 bot.onText(/\/start/, async (msg) => {
-  if (!isPrivateChat(msg)) return;
+  if (!isAllowedChat(msg)) return;
 
   const chatId = msg.chat.id;
   ensureSession(chatId);
 
-  if (db.admins.length === 0) {
+  if (db.admins.length === 0 && isPrivateChat(msg)) {
     addAdmin(chatId);
   }
 
-  await sendWelcomePhoto(chatId);
+  if (isPrivateChat(msg)) {
+    await sendWelcomePhoto(chatId);
+  } else {
+    await sendMessage(
+      chatId,
+      `✅ <b>AquaBahis Bot Aktif</b>\nBu grup için izleme başlatılıyor.`,
+      mainMenu(isAdmin(chatId))
+    );
+  }
+
   await startMonitoring(chatId);
 });
 
 bot.onText(/\/stop/, async (msg) => {
-  if (!isPrivateChat(msg)) return;
+  if (!isAllowedChat(msg)) return;
   await stopMonitoring(msg.chat.id);
 });
 
 bot.onText(/\/help/, async (msg) => {
-  if (!isPrivateChat(msg)) return;
+  if (!isAllowedChat(msg)) return;
   await help(msg.chat.id);
 });
 
 bot.onText(/\/check/, async (msg) => {
-  if (!isPrivateChat(msg)) return;
+  if (!isAllowedChat(msg)) return;
   await sendMessage(msg.chat.id, '🔎 Manuel kontrol başlatıldı...', mainMenu(isAdmin(msg.chat.id)));
   await checkAllForChat(msg.chat.id, { notifyAlways: true });
 });
 
 bot.onText(/\/status/, async (msg) => {
-  if (!isPrivateChat(msg)) return;
+  if (!isAllowedChat(msg)) return;
   await sendSummary(msg.chat.id);
 });
 
 bot.onText(/\/mute/, async (msg) => {
-  if (!isPrivateChat(msg)) return;
+  if (!isAllowedChat(msg)) return;
   await muteNotifications(msg.chat.id);
 });
 
 bot.onText(/\/unmute/, async (msg) => {
-  if (!isPrivateChat(msg)) return;
+  if (!isAllowedChat(msg)) return;
   await unmuteNotifications(msg.chat.id);
 });
 
 bot.onText(/\/sites/, async (msg) => {
-  if (!isPrivateChat(msg)) return;
+  if (!isAllowedChat(msg)) return;
   await listSites(msg.chat.id);
 });
 
 bot.onText(/\/admins/, async (msg) => {
-  if (!isPrivateChat(msg)) return;
+  if (!isAllowedChat(msg)) return;
   await listAdmins(msg.chat.id);
 });
 
 bot.onText(/\/addadmin(?:\s+(.+))?/, async (msg, match) => {
-  if (!isPrivateChat(msg)) return;
+  if (!isAllowedChat(msg)) return;
   await addAdminCommand(msg.chat.id, match && match[1]);
 });
 
 bot.onText(/\/addsite(?:\s+(.+))?/, async (msg, match) => {
-  if (!isPrivateChat(msg)) return;
+  if (!isAllowedChat(msg)) return;
   await addSite(msg.chat.id, match && match[1]);
 });
 
 bot.onText(/\/removesite(?:\s+(.+))?/, async (msg, match) => {
-  if (!isPrivateChat(msg)) return;
+  if (!isAllowedChat(msg)) return;
   await removeSite(msg.chat.id, match && match[1]);
 });
 
 bot.onText(/\/countries/, async (msg) => {
-  if (!isPrivateChat(msg)) return;
+  if (!isAllowedChat(msg)) return;
   await listCountries(msg.chat.id);
 });
 
 bot.onText(/\/addcountry(?:\s+(.+))?/, async (msg, match) => {
-  if (!isPrivateChat(msg)) return;
+  if (!isAllowedChat(msg)) return;
   await addCountry(msg.chat.id, match && match[1]);
 });
 
 bot.onText(/\/removecountry(?:\s+(.+))?/, async (msg, match) => {
-  if (!isPrivateChat(msg)) return;
+  if (!isAllowedChat(msg)) return;
   await removeCountry(msg.chat.id, match && match[1]);
 });
 
 bot.on('message', async (msg) => {
-  if (!isPrivateChat(msg)) return;
+  if (!isAllowedChat(msg)) return;
   if (!msg.text) return;
 
   const text = msg.text.trim();
@@ -853,7 +866,7 @@ bot.on('message', async (msg) => {
 
 bot.on('callback_query', async (query) => {
   const message = query.message;
-  if (!message || message.chat.type !== 'private') return;
+  if (!message || !['private', 'group', 'supergroup'].includes(message.chat.type)) return;
 
   const chatId = message.chat.id;
   const data = query.data || '';
